@@ -2,3 +2,5 @@ venv
 log*
 pdfbot.log
 config.py
+.idea
+UserData
