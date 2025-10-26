@@ -1,256 +1,255 @@
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types.message import ContentType
-from PIL import Image
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
 from config import api_token, sponsor_channel_link, sponsor_channel_id
 import shutil
 import os
 import logging
+from PIL import Image
+from docx import Document
+from docx.shared import Inches
+from PyPDF2 import PdfMerger
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
-# Set up logging configuration to save logs to 'pdfbot.log'
 log_file_path = dir_path + '/pdfbot.log'
-
 logging.basicConfig(
     filename=log_file_path,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# Initialize Telegram bot and Dispatcher
 bot = Bot(token=api_token)
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-# Dictionaries to store photo IDs and PDF names for each user
+user_modes = {}
 photos_id = {}
-pdf_names = {}
+docs_id = {}
+file_names = {}
 
+class MergeState(StatesGroup):
+    waiting_for_filename = State()
 
-async def is_channel_member(user_id):
-    member = await bot.get_chat_member(sponsor_channel_id, user_id)
-    if member.status == 'member' or member.status == 'administrator' or member.status == 'creator':
-        return True
-    return False
+class ConvertState(StatesGroup):
+    waiting_for_filename = State()
 
+def main_menu_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add('Изображения в PDF/DOCX')
+    keyboard.add('Соединение PDF/DOCX в один')
+    return keyboard
+
+def back_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add('Назад')
+    return keyboard
 
 @dp.message_handler(commands='start')
-async def show_main_list(message: types.Message):
-    keyboard_markup = types.InlineKeyboardMarkup(row_width=2)
-    keyboard_markup.add(types.InlineKeyboardButton('Join!', sponsor_channel_link))
-
-    await message.reply('Hi, now send me the images that you want convert to PDF. '
-                        '\n\nyou will be notified about added images,'
-                        '\n\nif you need high quality PDF send images as file!'
-                        '\n\nthis bot is totally free with NO watermarks! but you need to join the below channel to use it.',
-                        reply_markup=keyboard_markup)
-
-
-# Function to create and return a keyboard markup for converting images or removing added images
-def get_convert_and_delete_keyboard():
-    images_keyboard_markup = types.InlineKeyboardMarkup(row_width=1)
-    text_and_data = (
-        ('Convert to pdf', 'Convert to pdf'),
-        ('Remove added images', 'Remove added images'))
-    row_btns = (types.InlineKeyboardButton(text, callback_data=data) for text, data in text_and_data)
-    images_keyboard_markup.add(*row_btns)
-    return images_keyboard_markup
-
-
-def get_rename_pdf_keyboard():
-    images_keyboard_markup = types.InlineKeyboardMarkup(row_width=2)
-    text_and_data = (
-        ('Yes!', 'yes'),
-        ('No!', 'no'))
-    row_btns = (types.InlineKeyboardButton(text, callback_data=data) for text, data in text_and_data)
-    images_keyboard_markup.add(*row_btns)
-    return images_keyboard_markup
-
-# Handler for incoming document messages (for high-quality images)
-@dp.message_handler(content_types=ContentType.DOCUMENT)
-async def get_user_images_hq(message: types.Message):
-    if message.document.mime_type.split('/')[0] == 'image':
-        user_id = str(message.chat.id)
-
-        if not await is_channel_member(user_id):
-            keyboard_markup = types.InlineKeyboardMarkup(row_width=2)
-            keyboard_markup.add(types.InlineKeyboardButton('Join!', sponsor_channel_link))
-
-            return await message.reply(text='please join below channel first.', reply_markup=keyboard_markup)
-
-        else:
-            count = 1
-
-            for key, val in photos_id.items():
-                if list(val.keys())[0] == user_id:
-                    count += 1
-            try:
-                photos_id[message.document.file_id] = {user_id: count}
-            except Exception as e:
-                print(e)
-                pass
-
-            await message.reply(text=f'Your image added! \nnumber of added images: {count}',
-                                reply_markup=get_convert_and_delete_keyboard())
-
-
-@dp.message_handler(content_types=ContentType.PHOTO)
-async def get_user_images(message: types.Message):
+async def start_handler(message: types.Message):
     user_id = str(message.chat.id)
-    count = 1
-    # Count the number of added images for the user
-    if not await is_channel_member(user_id):
-        keyboard_markup = types.InlineKeyboardMarkup(row_width=2)
-        keyboard_markup.add(types.InlineKeyboardButton('Join!', sponsor_channel_link))
+    user_modes[user_id] = None
+    photos_id.pop(user_id, None)
+    docs_id.pop(user_id, None)
+    file_names.pop(user_id, None)
+    await message.answer('Выберите режим работы бота:', reply_markup=main_menu_keyboard())
 
-        return await message.reply(text='please join below channel first.', reply_markup=keyboard_markup)
+@dp.message_handler(lambda message: message.text == 'Назад')
+async def back_handler(message: types.Message, state: FSMContext):
+    user_id = str(message.chat.id)
+    user_modes[user_id] = None
+    photos_id.pop(user_id, None)
+    docs_id.pop(user_id, None)
+    file_names.pop(user_id, None)
+    await state.finish()
+    await message.answer('Вы вернулись в главное меню. Выберите режим работы бота:', reply_markup=main_menu_keyboard())
+
+@dp.message_handler(lambda message: message.text in ['Изображения в PDF/DOCX', 'Соединение PDF/DOCX в один'])
+async def mode_select_handler(message: types.Message):
+    user_id = str(message.chat.id)
+    photos_id.pop(user_id, None)
+    docs_id.pop(user_id, None)
+    file_names.pop(user_id, None)
+
+    if message.text == 'Изображения в PDF/DOCX':
+        user_modes[user_id] = 'mode_1'
+        await message.answer('Режим: Изображения в PDF/DOCX.\nОтправьте изображения для конвертации.', reply_markup=back_keyboard())
     else:
-        for key, val in photos_id.items():
-            if list(val.keys())[0] == user_id:
-                count += 1
-        try:
-            photos_id[message.photo[2].file_id] = {user_id: count}
-        except IndexError:
-            try:
-                photos_id[message.photo[1].file_id] = {user_id: count}
-            except IndexError:
-                photos_id[message.photo[0].file_id] = {user_id: count}
+        user_modes[user_id] = 'mode_2'
+        await message.answer('Режим: Соединение PDF/DOCX.\nОтправьте PDF или DOCX файлы для объединения.', reply_markup=back_keyboard())
 
-        await message.reply(text=f'Your image added! \nnumber of added images: {count}',
-                            reply_markup=get_convert_and_delete_keyboard())
-
-
-def delete_user_data(user_id):
-    user_photos_to_remove = []
-
-    # Find user's photos and store them for removal
-    for key, val in photos_id.items():
-        if list(val.keys())[0] == user_id:
-            user_photos_to_remove.append(key)
-
-        # Delete photos from photos_id dictionary
-    for el in user_photos_to_remove:
-        del photos_id[el]
-
-    try:
-        shutil.rmtree(dir_path + '/UserData/' + user_id)
-    except (FileExistsError, FileNotFoundError):
-        pass
-
-    try:
-        pdf_names.pop(user_id)
-    except KeyError:
-        pass
-
-
-@dp.callback_query_handler(text='Convert to pdf')
-async def convert_to_pdf(query: types.CallbackQuery):
-    await query.answer('')
-    await bot.send_message(query.message.chat.id, 'Do you want to set pdf name?',
-                           reply_markup=get_rename_pdf_keyboard())
-
-
-@dp.callback_query_handler(text='yes')
-async def send_pdf_name(query: types.CallbackQuery):
-    await bot.edit_message_text(chat_id=query.message.chat.id, text='Send you\'r prefer name as english words:',
-                                message_id=query.message.message_id)
-    await query.answer('')
-
-
-@dp.message_handler()
-async def set_pdf_name(message: types.Message):
+@dp.message_handler(content_types=[ContentType.PHOTO, ContentType.DOCUMENT])
+async def handle_files(message: types.Message, state: FSMContext):
     user_id = str(message.chat.id)
-    pdf_names[user_id] = message.text
+    mode = user_modes.get(user_id)
 
+    if mode == 'mode_1':
+        if message.content_type == ContentType.PHOTO or (message.content_type == ContentType.DOCUMENT and message.document.mime_type.startswith('image')):
+            user_photos = photos_id.get(user_id, [])
+            file_id = message.photo[-1].file_id if message.content_type == ContentType.PHOTO else message.document.file_id
+            user_photos.append(file_id)
+            photos_id[user_id] = user_photos
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton('Конвертировать в PDF', callback_data='convert_pdf'))
+            kb.add(types.InlineKeyboardButton('Конвертировать в DOCX', callback_data='convert_docx'))
+            await message.answer(f'Изображение добавлено! Всего изображений: {len(user_photos)}\n\nНажмите кнопку для конвертации.', reply_markup=kb)
+        else:
+            await message.answer('В режиме конвертации изображений принимаются только изображения. Пожалуйста, отправьте изображение.')
+    elif mode == 'mode_2':
+        if message.content_type == ContentType.DOCUMENT and message.document.mime_type in ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
+            user_docs = docs_id.get(user_id, [])
+            user_docs.append(message.document.file_id)
+            docs_id[user_id] = user_docs
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton('Объединить PDF', callback_data='merge_pdf'))
+            kb.add(types.InlineKeyboardButton('Объединить DOCX', callback_data='merge_docx'))
+            await message.answer(f'Документ добавлен! Всего документов: {len(user_docs)}\n\nНажмите кнопку для объединения.', reply_markup=kb)
+        else:
+            await message.answer('В режиме объединения принимаются только PDF или DOCX файлы. Пожалуйста, отправьте файл.')
+    else:
+        await message.answer('Пожалуйста, сначала выберите режим работы бота командой /start.')
+
+# Конвертация изображений
+@dp.callback_query_handler(lambda c: c.data in ['convert_pdf', 'convert_docx'])
+async def convert_images_handler(query: types.CallbackQuery):
+    user_id = str(query.message.chat.id)
+    await query.answer()
+    file_names[user_id] = None
+    bot_data_key = 'convert_format_' + user_id
+    bot[bot_data_key] = query.data
+    await query.message.answer('Введите желаемое имя файла (без расширения):')
+    await ConvertState.waiting_for_filename.set()
+
+@dp.message_handler(state=ConvertState.waiting_for_filename, content_types=types.ContentTypes.TEXT)
+async def process_convert_filename(message: types.Message, state: FSMContext):
+    user_id = str(message.chat.id)
+    filename = message.text.strip()
+    file_names[user_id] = filename
+
+    convert_format = bot.get('convert_format_' + user_id, 'convert_pdf')
     try:
-        pdf_path = f'{dir_path}/UserData/{user_id}/{pdf_names[user_id]}.pdf'
-        await image_to_pdf(user_id, pdf_path)
-
-    except KeyError:
-        print(KeyError)
-        pdf_path = f'{dir_path}/UserData/{user_id}/converted.pdf'
-        await image_to_pdf(user_id, pdf_path)
-
-    except IndexError:
-        await bot.send_message(message.chat.id, 'Please send you\'r images...')
+        await convert_and_send_file(user_id, filename, convert_format)
+    except Exception as e:
+        await message.answer(f'Ошибка при конвертации: {e}')
+        await state.finish()
         return
 
-    pdf = types.InputFile(pdf_path)
-    await bot.send_document(user_id, pdf)
+    await message.answer(f"Файл '{filename}' успешно создан и отправлен.", reply_markup=back_keyboard())
+    photos_id.pop(user_id, None)
+    docs_id.pop(user_id, None)
+    file_names.pop(user_id, None)
+    user_modes[user_id] = None
+    await state.finish()
 
-    delete_user_data(user_id)
+async def convert_and_send_file(user_id, filename, file_format):
+    user_dir = os.path.join(dir_path, 'UserData', user_id)
+    os.makedirs(user_dir, exist_ok=True)
 
-# Callback handler for 'no' response to convert without setting a PDF name
-@dp.callback_query_handler(text='no')
-async def convert_to_pdf(query: types.CallbackQuery):
-    await query.answer('Processing...')
-    await bot.edit_message_text(chat_id=query.message.chat.id, text='Processing...',
-                                message_id=query.message.message_id)
+    temp_photos = photos_id.get(user_id, [])
+    if not temp_photos:
+        raise IndexError("Нет изображений для конвертации")
+
+    for idx, file_id in enumerate(temp_photos, start=1):
+        path = os.path.join(user_dir, f'{idx}.jpg')
+        await bot.download_file_by_id(file_id, path)
+
+    if file_format == 'convert_pdf':
+        images = []
+        image_files = sorted([f for f in os.listdir(user_dir) if f.endswith('.jpg')],
+                             key=lambda x: int(os.path.splitext(x)[0]))
+        for im_name in image_files:
+            im = Image.open(os.path.join(user_dir, im_name))
+            images.append(im.convert('RGB'))
+        pdf_path = os.path.join(user_dir, f'{filename}.pdf')
+        if images:
+            images[0].save(pdf_path, save_all=True, append_images=images[1:])
+        upload_path = pdf_path
+
+    elif file_format == 'convert_docx':
+        doc = Document()
+        image_files = sorted([f for f in os.listdir(user_dir) if f.endswith('.jpg')],
+                             key=lambda x: int(os.path.splitext(x)[0]))
+        for im_name in image_files:
+            img_path = os.path.join(user_dir, im_name)
+            doc.add_picture(img_path, width=Inches(6))
+            doc.add_page_break()
+        docx_path = os.path.join(user_dir, f'{filename}.docx')
+        doc.save(docx_path)
+        upload_path = docx_path
+
+    else:
+        raise ValueError("Неизвестный формат конвертации")
+
+    await bot.send_document(user_id, types.InputFile(upload_path))
+
+# Обработка нажатий на кнопки объединения
+@dp.callback_query_handler(lambda c: c.data in ['merge_pdf', 'merge_docx'])
+async def merge_files_handler(query: types.CallbackQuery):
     user_id = str(query.message.chat.id)
+    await query.answer()
+    file_names[user_id] = None
+    bot_data_key = 'merge_format_' + user_id
+    bot[bot_data_key] = query.data
+    await query.message.answer('Введите желаемое имя итогового файла (без расширения):')
+    await MergeState.waiting_for_filename.set()
+
+@dp.message_handler(state=MergeState.waiting_for_filename, content_types=types.ContentTypes.TEXT)
+async def process_merge_filename(message: types.Message, state: FSMContext):
+    user_id = str(message.chat.id)
+    filename = message.text.strip()
+
+    merge_format = bot.get('merge_format_' + user_id)
+    user_docs = docs_id.get(user_id, [])
+    if not user_docs:
+        await message.answer('Нет файлов для объединения. Пожалуйста, отправьте PDF или DOCX файлы.')
+        await state.finish()
+        return
+
+    user_dir = os.path.join(dir_path, 'UserData', user_id)
+    os.makedirs(user_dir, exist_ok=True)
+
+    # Скачиваем все файлы
+    local_files = []
+    for idx, file_id in enumerate(user_docs, start=1):
+        file_ext = '.pdf' if merge_format == 'merge_pdf' else '.docx'
+        path = os.path.join(user_dir, f'{idx}{file_ext}')
+        await bot.download_file_by_id(file_id, path)
+        local_files.append(path)
 
     try:
-        pdf_path = f'{dir_path}/UserData/{user_id}/{pdf_names[user_id]}.pdf'
-        await image_to_pdf(user_id, pdf_path)
-
-    except KeyError:
-        try:
-            pdf_path = f'{dir_path}/UserData/{user_id}/converted.pdf'
-            await image_to_pdf(user_id, pdf_path)
-
-        except IndexError:
-            await bot.send_message(query.message.chat.id, 'Please send you\'r images first...')
+        if merge_format == 'merge_pdf':
+            merger = PdfMerger()
+            for pdf_file in local_files:
+                merger.append(pdf_file)
+            output_path = os.path.join(user_dir, f'{filename}.pdf')
+            with open(output_path, 'wb') as f_out:
+                merger.write(f_out)
+            merger.close()
+        elif merge_format == 'merge_docx':
+            merged_document = Document(local_files[0])
+            for docx_file in local_files[1:]:
+                sub_doc = Document(docx_file)
+                for element in sub_doc.element.body:
+                    merged_document.element.body.append(element)
+            output_path = os.path.join(user_dir, f'{filename}.docx')
+            merged_document.save(output_path)
+        else:
+            await message.answer('Неизвестный формат для объединения.')
+            await state.finish()
             return
 
-    except IndexError:
-        await bot.send_message(query.message.chat.id, 'Please send you\'r images first...')
-        return
+        await message.answer(f"Файл '{filename}' успешно создан и отправлен.", reply_markup=back_keyboard())
+        await bot.send_document(user_id, types.InputFile(output_path))
 
-    pdf = types.InputFile(pdf_path)
-    await bot.send_document(user_id, pdf)
-
-    delete_user_data(user_id)
-
-# Function to convert user's images to a PDF
-async def image_to_pdf(user_id, pdf_path):
-    try:
-        os.makedirs(dir_path + '/UserData/' + user_id)
-    except FileExistsError:
-        pass
-    temp_photos_id = photos_id.copy()
-
-    temp_photos_id.keys()
-    for key, val in temp_photos_id.items():
-
-        if list(val.keys())[0] == user_id:
-            await bot.download_file_by_id(key, dir_path + '/UserData/' + user_id + '/' + str(val[user_id]) + '.jpg')
-
-    images = []
-    try:
-        images_name = sorted([int(el[:-4]) for el in os.listdir(dir_path + '/UserData/' + user_id)])
-
-        # Open and convert images to RGB format
-        for im in images_name:
-            images.append(Image.open(dir_path + '/UserData/' + user_id + '/' + str(im) + '.jpg'))
-        images = [im.convert('RGB') for im in images]
     except Exception as e:
-        print(e)
-        pass
+        await message.answer(f'Ошибка при объединении файлов: {e}')
 
-    images[0].save(pdf_path,
-                   save_all=True, append_images=images[1:])
-    return True
-
-# Callback handler for 'Remove added images' button
-@dp.callback_query_handler(text='Remove added images')
-async def delete_images(query: types.CallbackQuery):
-    user_id = str(query.message.chat.id)
-
-    await query.answer('Added images removed.')
-
-    delete_user_data(user_id)
-
-    await bot.send_message(query.message.chat.id, 'Your added images have been deleted!'
-                                                  ' \n\nnow you can send images again.')
-
+    docs_id.pop(user_id, None)
+    file_names.pop(user_id, None)
+    user_modes[user_id] = None
+    await state.finish()
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
